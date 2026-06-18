@@ -1,5 +1,7 @@
 # Job Application CRM
 
+![Python](https://img.shields.io/badge/Python-3.11_|_3.12-3776AB?style=flat-square&logo=python) ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi) ![SQLite](https://img.shields.io/badge/SQLite-003B57?style=flat-square&logo=sqlite) ![Kanban](https://img.shields.io/badge/Kanban-E11D48?style=flat-square) ![Job Tracking](https://img.shields.io/badge/Job_Tracking-6366F1?style=flat-square)
+
 Kanban-style job application tracker with follow-up reminders and match notes.
 
 ## Why this project exists
