@@ -4,6 +4,8 @@
 
 Kanban-style job application tracker with follow-up reminders and match notes.
 
+![jobcrm-demo](screenshots/jobcrm-demo.png)
+
 ## Why this project exists
 
 This is a portfolio-ready MVP in the **job search productivity** lane. It demonstrates practical API product thinking, clean documentation, tests, and a working local browser demo.
