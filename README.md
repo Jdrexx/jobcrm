@@ -8,7 +8,7 @@ Kanban-style job application tracker with follow-up reminders and match notes.
 
 ## Why this project exists
 
-This is a portfolio-ready MVP in the **job search productivity** lane. It demonstrates practical API product thinking, clean documentation, tests, and a working local browser demo.
+Juggling a dozen job applications across different companies, remembering who to follow up with and when — that's what this tracker is for. It's a kanban board for your pipeline with contact notes, reminders, and an interview question generator built in.
 
 ## Features
 

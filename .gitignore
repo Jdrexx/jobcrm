@@ -6,3 +6,6 @@ __pycache__/
 data/*.sqlite
 data/*.sqlite-*
 .DS_Store
+.procoder/state/
+.procoder/index/
+.lycheecache
