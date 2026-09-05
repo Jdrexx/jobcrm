@@ -65,8 +65,16 @@ Channels with zero sends are dropped so the UI never shows 0% noise.
 
 `tests/test_api.py` runs hermetic: a fixture swaps `DB_FILE` to a temp path per
 test, so the suite never touches `data/app.sqlite` and repeated runs are stable.
-Validation errors surface as 422 (ValueError handler); missing rows as 404
-(KeyError handler) - both registered as FastAPI exception handlers.
+Validation errors surface as 422 and missing rows as 404 via two scoped
+exceptions (`Invalid`, a `ValueError` subclass, and `NotFound`) registered as
+FastAPI exception handlers - deliberately NOT the base `ValueError`/`KeyError`,
+so an internal fault (a corrupt legacy JSON payload, an unexpected key) surfaces
+as a 500 in the logs instead of a misleading 422/404 with internals in the body.
+`channel` is constrained server-side to `^[a-z0-9][a-z0-9-]*$` (the UI channel
+list all match) which also keeps it incapable of breaking out of an HTML
+attribute if it is ever rendered into one. Dates must be strict `YYYY-MM-DD`
+real calendar days, and `sent_on` cannot be in the future (a future send would
+sit in the 30-day window forever).
 
 The first version focuses on proving the workflow works locally. AI-specific
 behavior is implemented as deterministic heuristics where that makes tests
