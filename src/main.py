@@ -1,35 +1,22 @@
 from __future__ import annotations
+
 import json
+import re
 import sqlite3
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 APP_NAME = "Job Application CRM"
 APP_VERSION = "0.2.0"
 DB_FILE = Path(__file__).resolve().parent.parent / "data" / "app.sqlite"
-DB_FILE.parent.mkdir(exist_ok=True)
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
-
-
-@app.exception_handler(ValueError)
-def value_error_handler(request, exc: ValueError):
-    return JSONResponse(status_code=422, content={"detail": str(exc)})
-
-
-@app.exception_handler(KeyError)
-def key_error_handler(request, exc: KeyError):
-    return JSONResponse(
-        status_code=404, content={"detail": f"not found: {exc.args[0]}"}
-    )
 
 
 # Outreach lifecycle stages (application kanban statuses are separate and untouched).
@@ -53,14 +40,20 @@ FOLLOWUP_DAYS_NEXT = 5
 FOLLOWUP_MAX_ROUNDS = 2
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    conn.execute("pragma journal_mode=wal")
-    return conn
+@contextmanager
+def db() -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("pragma journal_mode=wal")
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
+    DB_FILE.parent.mkdir(exist_ok=True)
     with db() as conn:
         conn.execute(
             "create table if not exists records (id integer primary key autoincrement, kind text not null, title text not null, payload text not null, created_at text not null)"
@@ -89,16 +82,35 @@ def init_db() -> None:
         )
 
 
-@app.on_event("startup")
-def on_startup() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_db()
+    yield
+
+
+# CORS middleware is intentionally absent: the UI is served same-origin by this
+# app. If a public deployment ever serves the frontend from another origin, pin
+# explicit origins (never "*") and land auth first (see README roadmap).
+app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
+
+
+@app.exception_handler(ValueError)
+def value_error_handler(request, exc: ValueError):
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(KeyError)
+def key_error_handler(request, exc: KeyError):
+    return JSONResponse(
+        status_code=404, content={"detail": f"not found: {exc.args[0]}"}
+    )
 
 
 def save_record(kind: str, title: str, payload: str) -> int:
     with db() as conn:
         cur = conn.execute(
             "insert into records(kind,title,payload,created_at) values (?,?,?,?)",
-            (kind, title, payload, datetime.now(timezone.utc).isoformat()),
+            (kind, title, payload, datetime.now(UTC).isoformat()),
         )
         return int(cur.lastrowid)
 
@@ -116,7 +128,15 @@ def rows(kind: str | None = None) -> list[dict[str, Any]]:
 
 
 def today_iso() -> str:
-    return date.today().isoformat()
+    """Local calendar day (the day the user is in), canonical YYYY-MM-DD."""
+    return datetime.now().astimezone().date().isoformat()
+
+
+def normalize_iso_date(value: str) -> str:
+    """Require a strict YYYY-MM-DD and return it canonical; ValueError otherwise."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("date must be YYYY-MM-DD")
+    return date.fromisoformat(value).isoformat()
 
 
 def add_days(iso: str, days: int) -> str:
@@ -136,12 +156,15 @@ def outreach_row(r: sqlite3.Row) -> dict[str, Any]:
 # ---------------------------------------------------------------- applications (unchanged)
 @app.get("/api/health")
 def health():
+    with db() as conn:
+        records = conn.execute("select count(*) from records").fetchone()[0]
+        outreaches = conn.execute("select count(*) from outreaches").fetchone()[0]
     return {
         "ok": True,
         "app": APP_NAME,
         "version": APP_VERSION,
-        "records": len(rows()),
-        "outreaches": len(rows_outreaches()),
+        "records": records,
+        "outreaches": outreaches,
     }
 
 
@@ -205,12 +228,13 @@ class OutreachRequest(BaseModel):
     notes: str = ""
 
 
-def validate_outreach(req: OutreachRequest) -> None:
+def validate_outreach(req: OutreachRequest) -> str:
     if not req.company.strip():
         raise ValueError("company is required")
     if req.status not in OUTREACH_STATUSES:
         raise ValueError(f"status must be one of {', '.join(OUTREACH_STATUSES)}")
-    date.fromisoformat(req.sent_on)  # raises ValueError if malformed
+    # defaults sent_on to today, then requires strict YYYY-MM-DD (422 on junk)
+    return normalize_iso_date(req.sent_on or today_iso())
 
 
 def next_follow_up(status: str, sent_on: str, done: int) -> str | None:
@@ -230,9 +254,8 @@ def rows_outreaches() -> list[dict[str, Any]]:
 
 @app.post("/api/outreaches")
 def create_outreach(req: OutreachRequest):
-    req.sent_on = req.sent_on or today_iso()
-    validate_outreach(req)
-    follow_up_on = next_follow_up(req.status, req.sent_on, 0)
+    sent_on = validate_outreach(req)  # also defaults/normalizes the date
+    follow_up_on = next_follow_up(req.status, sent_on, 0)
     with db() as conn:
         cur = conn.execute(
             "insert into outreaches (company, role, channel, contact_name, contact_title, contact_email, variant, status, sent_on, follow_up_on, follow_ups_done, notes, created_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -245,11 +268,11 @@ def create_outreach(req: OutreachRequest):
                 req.contact_email.strip(),
                 req.variant.strip(),
                 req.status,
-                req.sent_on,
+                sent_on,
                 follow_up_on,
                 0,
                 req.notes.strip(),
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
         oid = int(cur.lastrowid)
@@ -274,39 +297,52 @@ class OutreachPatch(BaseModel):
 
 @app.patch("/api/outreaches/{oid}")
 def patch_outreach(oid: int, req: OutreachPatch):
+    if req.status is not None and req.status not in OUTREACH_STATUSES:
+        raise ValueError(f"status must be one of {', '.join(OUTREACH_STATUSES)}")
     with db() as conn:
         row = conn.execute("select * from outreaches where id=?", (oid,)).fetchone()
         if row is None:
             raise KeyError(oid)
         current = dict(row)
     status = req.status if req.status is not None else current["status"]
-    if req.status is not None and req.status not in OUTREACH_STATUSES:
-        raise ValueError(f"status must be one of {', '.join(OUTREACH_STATUSES)}")
-    done = current["follow_ups_done"]
-    follow_up_on = current["follow_up_on"]
-    if req.log_follow_up and status in ("sent", "replied"):
-        done = min(done + 1, FOLLOWUP_MAX_ROUNDS)
-        follow_up_on = next_follow_up(status, today_iso(), done)
-    if req.follow_up_on is not None:
-        follow_up_on = req.follow_up_on
-    if status in NO_FOLLOWUP_SET:
-        follow_up_on = None
-    fields = {"status": status, "follow_ups_done": done, "follow_up_on": follow_up_on}
-    if req.notes is not None:
-        fields["notes"] = req.notes
-    if req.variant is not None:
-        fields["variant"] = req.variant
+    notes = req.notes if req.notes is not None else current["notes"]
+    variant = req.variant if req.variant is not None else current["variant"]
+    manual_date = (
+        normalize_iso_date(req.follow_up_on) if req.follow_up_on is not None else None
+    )
+    log = int(req.log_follow_up and status in ("sent", "replied"))
+    terminal = int(status in NO_FOLLOWUP_SET)
+    # One atomic statement: the cadence increment is computed from the row's live
+    # value at write time, so concurrent "log follow-up" calls cannot lose an
+    # increment to a stale read-then-write.
     with db() as conn:
         conn.execute(
-            "update outreaches set status=?, follow_ups_done=?, follow_up_on=?, notes=?, variant=? where id=?",
-            (
-                fields["status"],
-                fields["follow_ups_done"],
-                fields["follow_up_on"],
-                fields.get("notes", current["notes"]),
-                fields.get("variant", current["variant"]),
-                oid,
-            ),
+            """
+            update outreaches set
+                status = :status,
+                notes = :notes,
+                variant = :variant,
+                follow_ups_done = min(follow_ups_done + :log, :cap),
+                follow_up_on = case
+                    when :terminal then null
+                    when :manual is not null then :manual
+                    when :log and min(follow_ups_done + :log, :cap) >= :cap then null
+                    when :log then :cadence_date
+                    else follow_up_on
+                end
+            where id = :oid
+            """,
+            {
+                "status": status,
+                "notes": notes,
+                "variant": variant,
+                "log": log,
+                "cap": FOLLOWUP_MAX_ROUNDS,
+                "terminal": terminal,
+                "manual": manual_date,
+                "cadence_date": add_days(today_iso(), FOLLOWUP_DAYS_NEXT),
+                "oid": oid,
+            },
         )
     return get_outreach(oid)
 
