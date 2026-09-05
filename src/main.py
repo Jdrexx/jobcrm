@@ -489,7 +489,7 @@ select.mini{width:auto;padding:3px 6px;font-size:12px}
 <div><label>Company</label><input id="f_company" placeholder="Miter"></div>
 <div><label>Role</label><input id="f_role" placeholder="Launch Operations Specialist"></div>
 <div><label>Channel</label><select id="f_channel">
-<option value="cold-apply">Cold apply (portal)</option><option value="referral">Referral</option>
+<option value="cold-apply">Cold apply (portal)</option><option value="indeed">Indeed</option><option value="referral">Referral</option>
 <option value="recruiter">Recruiter outreach</option><option value="hiring-manager">Hiring manager email</option>
 <option value="linkedin-dm">LinkedIn DM</option><option value="other">Other</option></select></div>
 <div><label>Contact</label><input id="f_contact" placeholder="Sarah Kim, Talent Lead"></div>
