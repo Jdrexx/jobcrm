@@ -15,7 +15,7 @@ Cold applications convert at 1-2%. Referrals and direct outreach convert at 15-4
 - Application pipeline (kanban by stage: saved / applied / interviewing / offer / rejected)
 - Interview question generator
 - **Outreach log** - one row per touch: company, role, channel, contact, sent date, status
-- **Follow-up cadence** - auto-scheduled: send -> follow up in 4 days -> 5 days after each logged follow-up -> max 2 rounds, then the cadence stops; replies and screens clear it
+- **Follow-up cadence** - auto-scheduled: send -> follow up in 4 days -> 5 days after each logged follow-up -> max 2 rounds, then it stops. Moving a row to screen/interview/offer/rejected/dead clears the cadence; replied keeps it running until the conversation actually moves on.
 - **Due-now queue** - everything due today, one click to log the follow-up or mark replied
 - **Channel dashboard** - reply rate, sent volume, and funnel counts per channel (referral / recruiter / hiring manager / cold apply / LinkedIn DM)
 

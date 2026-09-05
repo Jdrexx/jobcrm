@@ -41,6 +41,16 @@ Constants in `src/main.py`:
 deterministic core the tests pin down. "Due" is computed, never stored: a row
 is due when `follow_up_on <= today` and status is `sent` or `replied`.
 
+## Dates and clocks
+
+Calendar-day fields (`sent_on`, `follow_up_on`) are local calendar days in the
+server's timezone, produced through an aware local clock (`today_iso()`); the
+UI date input sends the same local day. `created_at` timestamps are UTC. The
+two never mix in a comparison: cadence, due, and 30-day windows compare
+calendar days only. Both endpoints require strict `YYYY-MM-DD` and store the
+canonical form - junk or non-canonical dates (e.g. `2026-9-4`) are rejected
+with 422.
+
 ## Channel stats
 
 `/api/dashboard` groups non-draft rows by channel and computes:
