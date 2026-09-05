@@ -12,11 +12,23 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 APP_NAME = "Job Application CRM"
 APP_VERSION = "0.2.0"
 DB_FILE = Path(__file__).resolve().parent.parent / "data" / "app.sqlite"
+
+
+# Application errors mapped to HTTP responses. Scoped types (not the base
+# ValueError/KeyError) so an internal fault - a corrupt legacy payload row, a
+# stray KeyError - surfaces as a 500 in the logs instead of masquerading as a
+# 422/404 with internals in the body (CWE-209).
+class Invalid(ValueError):
+    """Caller-supplied data failed validation (422)."""
+
+
+class NotFound(Exception):
+    """Requested entity does not exist (404)."""
 
 
 # Outreach lifecycle stages (application kanban statuses are separate and untouched).
@@ -42,10 +54,9 @@ FOLLOWUP_MAX_ROUNDS = 2
 
 @contextmanager
 def db() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(DB_FILE, timeout=10)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     try:
         conn.row_factory = sqlite3.Row
-        conn.execute("pragma journal_mode=wal")
         with conn:
             yield conn
     finally:
@@ -55,6 +66,9 @@ def db() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     DB_FILE.parent.mkdir(exist_ok=True)
     with db() as conn:
+        # WAL is persistent in the database header once set here; per-request
+        # connections inherit it, so the pragma runs exactly once per file.
+        conn.execute("pragma journal_mode=wal")
         conn.execute(
             "create table if not exists records (id integer primary key autoincrement, kind text not null, title text not null, payload text not null, created_at text not null)"
         )
@@ -94,13 +108,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 
 
-@app.exception_handler(ValueError)
-def value_error_handler(request, exc: ValueError):
+@app.exception_handler(Invalid)
+def invalid_handler(request, exc: Invalid):
     return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
-@app.exception_handler(KeyError)
-def key_error_handler(request, exc: KeyError):
+@app.exception_handler(NotFound)
+def not_found_handler(request, exc: NotFound):
     return JSONResponse(
         status_code=404, content={"detail": f"not found: {exc.args[0]}"}
     )
@@ -133,10 +147,14 @@ def today_iso() -> str:
 
 
 def normalize_iso_date(value: str) -> str:
-    """Require a strict YYYY-MM-DD and return it canonical; ValueError otherwise."""
+    """Require a strict YYYY-MM-DD and return it canonical; Invalid otherwise."""
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-        raise ValueError("date must be YYYY-MM-DD")
-    return date.fromisoformat(value).isoformat()
+        raise Invalid("date must be YYYY-MM-DD")
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        # matched the shape but not a real calendar date (e.g. 2026-13-99)
+        raise Invalid("date must be a valid calendar date") from None
 
 
 def add_days(iso: str, days: int) -> str:
@@ -216,25 +234,33 @@ def interview_questions(req: ApplicationRequest):
 
 # ---------------------------------------------------------------- outreach layer (new in 0.2.0)
 class OutreachRequest(BaseModel):
-    company: str
-    role: str = ""
-    channel: str = "cold-apply"
-    contact_name: str = ""
-    contact_title: str = ""
-    contact_email: str = ""
-    variant: str = ""
+    company: str = Field(min_length=1, max_length=200)
+    role: str = Field(default="", max_length=200)
+    # Lowercase-hyphen pattern doubles as the XSS guard: it can never carry a
+    # character that would break out of an HTML attribute if channel is ever
+    # rendered into one (CWE-79/83).
+    channel: str = Field(
+        default="cold-apply", max_length=40, pattern=r"^[a-z0-9][a-z0-9-]*$"
+    )
+    contact_name: str = Field(default="", max_length=200)
+    contact_title: str = Field(default="", max_length=200)
+    contact_email: str = Field(default="", max_length=320)
+    variant: str = Field(default="", max_length=80)
     status: str = "sent"
     sent_on: str | None = None
-    notes: str = ""
+    notes: str = Field(default="", max_length=10_000)
 
 
 def validate_outreach(req: OutreachRequest) -> str:
     if not req.company.strip():
-        raise ValueError("company is required")
+        raise Invalid("company is required")
     if req.status not in OUTREACH_STATUSES:
-        raise ValueError(f"status must be one of {', '.join(OUTREACH_STATUSES)}")
-    # defaults sent_on to today, then requires strict YYYY-MM-DD (422 on junk)
-    return normalize_iso_date(req.sent_on or today_iso())
+        raise Invalid(f"status must be one of {', '.join(OUTREACH_STATUSES)}")
+    sent_on = normalize_iso_date(req.sent_on or today_iso())
+    if sent_on > today_iso():
+        # a future-dated send would sit in the 30-day window forever
+        raise Invalid("sent_on cannot be in the future")
+    return sent_on
 
 
 def next_follow_up(status: str, sent_on: str, done: int) -> str | None:
@@ -283,7 +309,7 @@ def get_outreach(oid: int) -> dict[str, Any]:
     with db() as conn:
         row = conn.execute("select * from outreaches where id=?", (oid,)).fetchone()
     if row is None:
-        raise KeyError(oid)
+        raise NotFound(oid)
     return outreach_row(row)
 
 
@@ -298,25 +324,27 @@ class OutreachPatch(BaseModel):
 @app.patch("/api/outreaches/{oid}")
 def patch_outreach(oid: int, req: OutreachPatch):
     if req.status is not None and req.status not in OUTREACH_STATUSES:
-        raise ValueError(f"status must be one of {', '.join(OUTREACH_STATUSES)}")
-    with db() as conn:
-        row = conn.execute("select * from outreaches where id=?", (oid,)).fetchone()
-        if row is None:
-            raise KeyError(oid)
-        current = dict(row)
-    status = req.status if req.status is not None else current["status"]
-    notes = req.notes if req.notes is not None else current["notes"]
-    variant = req.variant if req.variant is not None else current["variant"]
+        raise Invalid(f"status must be one of {', '.join(OUTREACH_STATUSES)}")
     manual_date = (
         normalize_iso_date(req.follow_up_on) if req.follow_up_on is not None else None
     )
-    log = int(req.log_follow_up and status in ("sent", "replied"))
-    terminal = int(status in NO_FOLLOWUP_SET)
-    # One atomic statement: the cadence increment is computed from the row's live
-    # value at write time, so concurrent "log follow-up" calls cannot lose an
-    # increment to a stale read-then-write.
+    # Read + write share one transaction, and the UPDATE reports how many rows it
+    # changed, so a row deleted between the read and the write raises 404 instead
+    # of silently succeeding into a phantom response.
     with db() as conn:
-        conn.execute(
+        row = conn.execute("select * from outreaches where id=?", (oid,)).fetchone()
+        if row is None:
+            raise NotFound(oid)
+        current = dict(row)
+        status = req.status if req.status is not None else current["status"]
+        notes = req.notes if req.notes is not None else current["notes"]
+        variant = req.variant if req.variant is not None else current["variant"]
+        log = int(req.log_follow_up and status in ("sent", "replied"))
+        terminal = int(status in NO_FOLLOWUP_SET)
+        # One atomic statement: the cadence increment is computed from the row's
+        # live value at write time, so concurrent "log follow-up" calls cannot
+        # lose an increment to a stale read-then-write.
+        cur = conn.execute(
             """
             update outreaches set
                 status = :status,
@@ -344,6 +372,10 @@ def patch_outreach(oid: int, req: OutreachPatch):
                 "oid": oid,
             },
         )
+        if cur.rowcount == 0:
+            raise NotFound(oid)
+    # follow_ups_done / follow_up_on were computed inside SQL; re-read to return
+    # the canonical row rather than reconstructing the CASE logic in Python.
     return get_outreach(oid)
 
 
@@ -386,7 +418,10 @@ def dashboard():
                 sent_30d += 1
         if o["status"] in REPLIED_SET:
             ch["replies"] += 1
-        funnel[o["status"]] += 1
+        # tolerate legacy/hand-edited statuses instead of raising (they used to
+        # surface as a misleading 404 via the old blanket KeyError handler)
+        if o["status"] in funnel:
+            funnel[o["status"]] += 1
         if o["due"]:
             due += 1
     for ch in by_channel.values():
@@ -480,7 +515,10 @@ let FILTER = 'all';
 const esc = (s) => { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; };
 const STATUSES = ['draft','sent','replied','screen','interview','offer','rejected','dead'];
 function pill(status, due){
-  const cls = due ? 'due' : status;
+  // status is only ever drawn from the whitelisted STATUSES, so the class can
+  // never break out of the attribute even if esc() (text-node escaping) lets
+  // quotes through. Unknown values degrade to the neutral pill, not a raw class.
+  const cls = due ? 'due' : (STATUSES.includes(status) ? status : 'unknown');
   return '<span class="pill ' + esc(cls) + '">' + esc(status) + (due ? ' (due)' : '') + '</span>';
 }
 async function api(url, opts){

@@ -319,3 +319,46 @@ def test_concurrent_log_follow_up_loses_no_increment(client):
     # two simultaneous logs must both land: 0 -> 1 -> 2, then the cadence stops
     assert row["follow_ups_done"] == 2
     assert row["follow_up_on"] is None
+
+
+def test_create_outreach_rejects_future_sent_on(client):
+    from datetime import date, timedelta
+
+    future = (date.today() + timedelta(days=3)).isoformat()
+    r = post_outreach(client, sent_on=future)
+    assert r.status_code == 422
+
+
+def test_create_outreach_rejects_invalid_channel(client):
+    r = post_outreach(client, channel="Not A Channel!")
+    assert r.status_code == 422
+
+
+def test_dashboard_tolerates_unknown_status_in_db(client):
+    import sqlite3
+
+    sqlite3.connect(str(main.DB_FILE)).execute(
+        "insert into outreaches (company, sent_on, status, created_at) "
+        "values ('Legacy Co', '2025-01-01', 'legacy', '')"
+    ).connection.commit()
+    r = client.get("/api/dashboard")
+    assert r.status_code == 200
+    # the unknown status is counted in the total but not a funnel column
+    assert r.json()["total"] >= 1
+    assert "legacy" not in r.json()["funnel"]
+
+
+def test_corrupt_payload_is_500_not_422(client):
+    import sqlite3
+
+    from fastapi.testclient import TestClient
+
+    sqlite3.connect(str(main.DB_FILE)).execute(
+        "insert into records (kind, title, payload, created_at) "
+        "values ('application', 'Broken', '{not-json', '')"
+    ).connection.commit()
+    # default TestClient re-raises server exceptions; this one observes the wire
+    strict_client = TestClient(main.app, raise_server_exceptions=False)
+    r = strict_client.get("/api/applications")
+    # a corrupt legacy row is a server-side fault (500), not a client error
+    assert r.status_code == 500
