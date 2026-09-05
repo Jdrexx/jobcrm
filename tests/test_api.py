@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
-import src.main as main
+
+from src import main
 
 
 @pytest.fixture()
@@ -243,3 +244,78 @@ def test_legacy_interview_questions_still_work(client):
     r = client.post("/api/interview-questions", json={"company": "X", "role": "CSM"})
     assert r.status_code == 200
     assert len(r.json()["questions"]) == 3
+
+
+def test_patch_rejects_malformed_follow_up_date(client):
+    o = post_outreach(client).json()
+    r = client.patch(f"/api/outreaches/{o['id']}", json={"follow_up_on": "not-a-date"})
+    assert r.status_code == 422
+
+
+def test_patch_rejects_out_of_range_follow_up_date(client):
+    o = post_outreach(client).json()
+    r = client.patch(f"/api/outreaches/{o['id']}", json={"follow_up_on": "2026-13-99"})
+    assert r.status_code == 422
+
+
+def test_patch_rejects_non_canonical_follow_up_date(client):
+    o = post_outreach(client).json()
+    r = client.patch(f"/api/outreaches/{o['id']}", json={"follow_up_on": "2026-9-4"})
+    assert r.status_code == 422
+
+
+def test_patch_accepts_valid_follow_up_date(client):
+    from datetime import date, timedelta
+
+    o = post_outreach(client).json()
+    future = (date.today() + timedelta(days=9)).isoformat()
+    r = client.patch(f"/api/outreaches/{o['id']}", json={"follow_up_on": future})
+    assert r.status_code == 200
+    assert r.json()["follow_up_on"] == future
+
+
+def test_create_outreach_rejects_non_canonical_sent_on(client):
+    r = post_outreach(client, sent_on="2026-9-4")
+    assert r.status_code == 422
+
+
+def test_terminal_status_overrides_manual_follow_up_date(client):
+    o = post_outreach(client).json()
+    future = "2030-01-01"
+    r = client.patch(
+        f"/api/outreaches/{o['id']}",
+        json={"status": "screen", "follow_up_on": future},
+    )
+    assert r.status_code == 200
+    assert r.json()["follow_up_on"] is None
+
+
+def test_concurrent_log_follow_up_loses_no_increment(client):
+    import threading
+
+    o = post_outreach(client).json()
+    barrier = threading.Barrier(2)
+    statuses = []
+
+    def hit():
+        barrier.wait()
+        statuses.append(
+            client.patch(
+                f"/api/outreaches/{o['id']}", json={"log_follow_up": True}
+            ).status_code
+        )
+
+    threads = [threading.Thread(target=hit) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    row = next(
+        x
+        for x in client.get("/api/outreaches").json()["outreaches"]
+        if x["id"] == o["id"]
+    )
+    assert statuses == [200, 200]
+    # two simultaneous logs must both land: 0 -> 1 -> 2, then the cadence stops
+    assert row["follow_ups_done"] == 2
+    assert row["follow_up_on"] is None
